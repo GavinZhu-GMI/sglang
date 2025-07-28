@@ -58,6 +58,9 @@ struct Router {
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
+    // Additional server config fields
+    max_concurrent_requests: usize,
+    cors_allowed_origins: Vec<String>,
 }
 
 impl Router {
@@ -141,6 +144,8 @@ impl Router {
             log_dir: self.log_dir.clone(),
             log_level: self.log_level.clone(),
             request_id_headers: self.request_id_headers.clone(),
+            max_concurrent_requests: self.max_concurrent_requests,
+            cors_allowed_origins: self.cors_allowed_origins.clone(),
         })
     }
 }
@@ -178,7 +183,9 @@ impl Router {
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
-        decode_policy = None
+        decode_policy = None,
+        max_concurrent_requests = 64,
+        cors_allowed_origins = vec![]
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -211,6 +218,8 @@ impl Router {
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
         decode_policy: Option<PolicyType>,
+        max_concurrent_requests: usize,
+        cors_allowed_origins: Vec<String>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -243,6 +252,8 @@ impl Router {
             decode_urls,
             prefill_policy,
             decode_policy,
+            max_concurrent_requests,
+            cors_allowed_origins,
         })
     }
 
