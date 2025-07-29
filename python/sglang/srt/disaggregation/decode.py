@@ -855,9 +855,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.server_args.enable_custom_logit_processor,
         )
 
+        logger.info("Constructing fake prefill!")
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt_extend()
-        new_batch.process_prebuilt_extend(self.server_args, self.model_config)
+        new_batch.process_prebuilt_extend(self.server_args, self.model_config, self)
 
         return new_batch
 

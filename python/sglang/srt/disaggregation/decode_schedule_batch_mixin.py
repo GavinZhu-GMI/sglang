@@ -92,17 +92,28 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self,
             self.model_config.vocab_size,
         )
-
     def process_prebuilt_extend(
-        self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig
+        self: "ScheduleBatch", server_args: "ServerArgs", model_config: "ModelConfig", scheduler: "Scheduler" = None
     ):
         """Assign the buffered last input id to schedule batch"""
         self.output_ids = []
+
+        from sglang.srt.managers.io_struct import AbortReq
         for req in self.reqs:
             self.output_ids.append(req.output_ids[-1])
             self.tree_cache.cache_unfinished_req(req)
             if req.grammar is not None:
-                req.grammar.accept_token(req.output_ids[-1])
+                # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                try:
+                    req.grammar.accept_token(req.output_ids[-1])
+                except ValueError as e:
+                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                    # This can happen if the grammar is not set correctly or the token is invalid.
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
+                    )
+                    if scheduler:
+                        scheduler.abort_request(AbortReq(req.rid))
                 req.grammar.finished = req.finished()
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
