@@ -53,6 +53,7 @@ impl PDRouter {
             self.timeout_secs,
             self.interval_secs,
         )
+        .await
         .map_err(|_| PDRouterError::HealthCheckFailed { url: url.clone() })?;
 
         // Create Worker for the new prefill server
@@ -89,6 +90,7 @@ impl PDRouter {
             self.timeout_secs,
             self.interval_secs,
         )
+        .await
         .map_err(|_| PDRouterError::HealthCheckFailed { url: url.clone() })?;
 
         // Create Worker for the new decode server
@@ -172,7 +174,7 @@ impl PDRouter {
         Ok(format!("Successfully removed decode server: {}", url))
     }
 
-    pub fn new(
+    pub async fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
         prefill_policy: Arc<dyn LoadBalancingPolicy>,
@@ -203,7 +205,8 @@ impl PDRouter {
                 &all_urls,
                 timeout_secs,
                 interval_secs,
-            )?;
+            )
+            .await?;
         }
 
         // Initialize cache-aware components if needed for prefill policy

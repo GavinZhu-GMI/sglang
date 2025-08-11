@@ -13,7 +13,6 @@ use axum::{
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::thread;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
@@ -46,7 +45,7 @@ pub struct Router {
 
 impl Router {
     /// Create a new router with injected policy and client
-    pub fn new(
+    pub async fn new(
         worker_urls: Vec<String>,
         policy: Arc<dyn LoadBalancingPolicy>,
         client: Client,
@@ -55,75 +54,75 @@ impl Router {
         dp_aware: bool,
         api_key: Option<String>,
     ) -> Result<Self, String> {
-        // Update active workers gauge
-        RouterMetrics::set_active_workers(worker_urls.len());
+        let mut router = Self {
+            workers: Arc::new(RwLock::new(Vec::new())),
+            policy,
+            client,
+            timeout_secs,
+            interval_secs,
+            dp_aware,
+            api_key: api_key.clone(),
+            _worker_loads: Arc::new(tokio::sync::watch::channel(HashMap::new()).1),
+            _load_monitor_handle: None,
+            _health_checker: None,
+        };
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
-            Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)?;
+            Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs).await?;
         }
 
+        // If dp_aware is enabled, expand worker URLs with dp_rank suffixes
         let worker_urls = if dp_aware {
-            // worker address now in the format of "http://host:port@dp_rank"
-            Self::get_dp_aware_workers(&worker_urls, &api_key)
-                .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?
+            Self::get_dp_aware_workers(&worker_urls, &api_key).await?
         } else {
             worker_urls
         };
 
-        // Create Worker trait objects from URLs
-        let workers: Vec<Box<dyn Worker>> = worker_urls
-            .iter()
-            .map(|url| WorkerFactory::create_regular(url.clone()))
-            .collect();
-
-        // Initialize policy with workers if needed (e.g., for cache-aware)
-        if let Some(cache_aware) = policy
-            .as_any()
-            .downcast_ref::<crate::policies::CacheAwarePolicy>()
-        {
-            cache_aware.init_workers(&workers);
+        // Add workers
+        for worker_url in worker_urls {
+            let new_worker = WorkerFactory::create_regular(worker_url);
+            router.workers.write().unwrap().push(new_worker);
         }
 
-        let workers = Arc::new(RwLock::new(workers));
-        let health_checker = crate::core::start_health_checker(Arc::clone(&workers), interval_secs);
+        // Start load monitoring
+        router.start_load_monitoring();
+
+        Ok(router)
+    }
+
+    fn start_load_monitoring(&mut self) {
+        // Start load monitoring
+        let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
+        self._worker_loads = Arc::new(rx);
 
         // Setup load monitoring for PowerOfTwo policy
-        let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
-        let worker_loads = Arc::new(rx);
+        if self.policy.name() == "power_of_two" {
+            let worker_urls = self.get_worker_urls();
+            let monitor_interval = self.interval_secs;
+            let policy_clone = Arc::clone(&self.policy);
+            let client_clone = self.client.clone();
 
-        let load_monitor_handle = if policy.name() == "power_of_two" {
-            let monitor_urls = worker_urls.clone();
-            let monitor_interval = interval_secs;
-            let policy_clone = Arc::clone(&policy);
-            let client_clone = client.clone();
-
-            Some(Arc::new(tokio::spawn(async move {
+            self._load_monitor_handle = Some(Arc::new(tokio::spawn(async move {
                 Self::monitor_worker_loads(
-                    monitor_urls,
+                    worker_urls,
                     tx,
                     monitor_interval,
                     policy_clone,
                     client_clone,
                 )
                 .await;
-            })))
-        } else {
-            None
-        };
+            })));
+        }
 
-        Ok(Router {
-            workers,
-            policy,
-            client,
-            timeout_secs,
-            interval_secs,
-            dp_aware,
-            api_key,
-            _worker_loads: worker_loads,
-            _load_monitor_handle: load_monitor_handle,
-            _health_checker: Some(health_checker),
-        })
+        // Start health checker
+        self._health_checker = Some(crate::core::start_health_checker(
+            Arc::clone(&self.workers),
+            self.interval_secs,
+        ));
+
+        // Update active workers gauge
+        RouterMetrics::set_active_workers(self.workers.read().unwrap().len());
     }
 
     /// Get the current list of worker URLs
@@ -136,13 +135,13 @@ impl Router {
             .collect()
     }
 
-    pub fn wait_for_healthy_workers(
+    pub async fn wait_for_healthy_workers(
         worker_urls: &[String],
         timeout_secs: u64,
         interval_secs: u64,
     ) -> Result<(), String> {
         let start_time = std::time::Instant::now();
-        let sync_client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
@@ -163,7 +162,7 @@ impl Router {
             let mut unhealthy_workers = Vec::new();
 
             for url in worker_urls {
-                match sync_client.get(&format!("{}/health", url)).send() {
+                match client.get(&format!("{}/health", url)).send().await {
                     Ok(res) => {
                         if !res.status().is_success() {
                             all_healthy = false;
@@ -186,23 +185,24 @@ impl Router {
                     worker_urls.len(),
                     unhealthy_workers.len()
                 );
-                thread::sleep(Duration::from_secs(interval_secs));
+                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
             }
         }
     }
 
-    fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
-        let sync_client = reqwest::blocking::Client::new();
-        let mut req_builder = sync_client.get(&format!("{}/get_server_info", worker_url));
+    async fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
+        let client = reqwest::Client::new();
+        let mut req_builder = client.get(&format!("{}/get_server_info", worker_url));
         if let Some(key) = api_key {
             req_builder = req_builder.bearer_auth(key);
         }
 
-        match req_builder.send() {
+        match req_builder.send().await {
             Ok(res) => {
                 if res.status().is_success() {
                     let server_info = res
                         .text()
+                        .await
                         .map_err(|e| format!("failed to read text from response: {}", e))?;
 
                     let server_info: serde_json::Value = serde_json::from_str(&server_info)
@@ -227,14 +227,14 @@ impl Router {
     }
 
     // Given a list of workers, return a list of workers with dp_rank as suffix
-    fn get_dp_aware_workers(
+    async fn get_dp_aware_workers(
         worker_urls: &[String],
         api_key: &Option<String>,
     ) -> Result<Vec<String>, String> {
         let mut dp_aware_workers: Vec<String> = Vec::new();
 
         for url in worker_urls {
-            match Self::get_worker_dp_size(url, api_key) {
+            match Self::get_worker_dp_size(url, api_key).await {
                 Ok(dp_size) => {
                     for i in 0..dp_size {
                         dp_aware_workers.push(format!("{}@{}", url, i));
@@ -725,13 +725,14 @@ impl Router {
             match client.get(&format!("{}/health", worker_url)).send().await {
                 Ok(res) => {
                     if res.status().is_success() {
-                        let mut workers_guard = self.workers.write().unwrap();
                         if self.dp_aware {
-                            // Need to contact the worker to extract the dp_size,
-                            // and add them as multiple workers
+                            // Need to contact the worker to extract the dp_size first
                             let url_vec = vec![String::from(worker_url)];
-                            let dp_url_vec = Self::get_dp_aware_workers(&url_vec, &self.api_key)
+                            let dp_url_vec = Self::get_dp_aware_workers(&url_vec, &self.api_key).await
                                 .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
+                            
+                            // Now acquire the lock and add workers
+                            let mut workers_guard = self.workers.write().unwrap();
                             let mut worker_added: bool = false;
                             for dp_url in &dp_url_vec {
                                 if workers_guard.iter().any(|w| w.url() == dp_url) {
@@ -746,27 +747,42 @@ impl Router {
                             if !worker_added {
                                 return Err(format!("No worker added for {}", worker_url));
                             }
+                            
+                            let worker_count = workers_guard.len();
+                            RouterMetrics::set_active_workers(worker_count);
+                            
+                            // If cache aware policy, initialize the worker in the tree
+                            if let Some(cache_aware) =
+                                self.policy
+                                    .as_any()
+                                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                            {
+                                drop(workers_guard);
+                                let workers_guard = self.workers.read().unwrap();
+                                cache_aware.init_workers(&workers_guard);
+                            }
                         } else {
+                            let mut workers_guard = self.workers.write().unwrap();
                             if workers_guard.iter().any(|w| w.url() == worker_url) {
                                 return Err(format!("Worker {} already exists", worker_url));
                             }
                             info!("Added worker: {}", worker_url);
                             let new_worker = WorkerFactory::create_regular(worker_url.to_string());
                             workers_guard.push(new_worker);
-                        }
-
-                        RouterMetrics::set_active_workers(workers_guard.len());
-
-                        // If cache aware policy, initialize the worker in the tree
-                        if let Some(cache_aware) =
-                            self.policy
-                                .as_any()
-                                .downcast_ref::<crate::policies::CacheAwarePolicy>()
-                        {
-                            // Get updated workers after adding
-                            drop(workers_guard);
-                            let workers_guard = self.workers.read().unwrap();
-                            cache_aware.init_workers(&workers_guard);
+                            
+                            let worker_count = workers_guard.len();
+                            RouterMetrics::set_active_workers(worker_count);
+                            
+                            // If cache aware policy, initialize the worker in the tree
+                            if let Some(cache_aware) =
+                                self.policy
+                                    .as_any()
+                                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                            {
+                                drop(workers_guard);
+                                let workers_guard = self.workers.read().unwrap();
+                                cache_aware.init_workers(&workers_guard);
+                            }
                         }
 
                         return Ok(format!("Successfully added worker: {}", worker_url));
@@ -1235,17 +1251,17 @@ mod tests {
         assert_eq!(result.unwrap(), "http://worker1:8080");
     }
 
-    #[test]
-    fn test_wait_for_healthy_workers_empty_list() {
-        let result = Router::wait_for_healthy_workers(&[], 1, 1);
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_empty_list() {
+        let result = Router::wait_for_healthy_workers(&[], 1, 1).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_wait_for_healthy_workers_invalid_urls() {
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_invalid_urls() {
         // This test will timeout quickly since the URLs are invalid
         let result =
-            Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1);
+            Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Timeout"));
     }

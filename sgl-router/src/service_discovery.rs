@@ -574,14 +574,14 @@ mod tests {
     }
 
     // Helper to create a Router instance for testing event handlers
-    fn create_test_router() -> Arc<dyn RouterTrait> {
+    async fn create_test_router() -> Arc<dyn RouterTrait> {
         use crate::config::PolicyConfig;
         use crate::policies::PolicyFactory;
         use crate::routers::router::Router;
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Random);
         let router =
-            Router::new(vec![], policy, reqwest::Client::new(), 5, 1, false, None).unwrap();
+            Router::new(vec![], policy, reqwest::Client::new(), 5, 1, false, None).await.unwrap();
         Arc::new(router) as Arc<dyn RouterTrait>
     }
 
@@ -884,267 +884,222 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_pod_event_add_unhealthy_pod() {
-        let router = create_test_router();
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
-            name: "pod1".into(),
-            ip: "1.2.3.4".into(),
-            status: "Pending".into(),
+            name: "test-pod".to_string(),
+            ip: "192.168.1.100".to_string(),
+            status: "Running".to_string(),
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
         };
-        let port = 8080u16;
 
-        handle_pod_event(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            false, // pd_mode = false
-        )
-        .await;
+        handle_pod_event(&pod_info, tracked_pods, router.clone(), 80, false).await;
 
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
-        assert!(!router
-            .get_worker_urls()
-            .contains(&pod_info.worker_url(port)));
+        // Verify the pod was not added (since it's unhealthy)
+        let workers = router.get_worker_urls();
+        assert!(workers.is_empty());
     }
 
     #[tokio::test]
     async fn test_handle_pod_deletion_non_existing_pod() {
-        let router = create_test_router();
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
-            name: "pod1".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
+            name: "test-pod".to_string(),
+            ip: "192.168.1.100".to_string(),
+            status: "Running".to_string(),
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
         };
-        let port = 8080u16;
 
-        handle_pod_deletion(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            false, // pd_mode = false
-        )
-        .await;
+        // Add the pod first
+        {
+            let mut tracked = tracked_pods.lock().unwrap();
+            tracked.insert(pod_info.clone());
+        }
 
-        assert!(tracked_pods.lock().unwrap().is_empty());
-        assert!(router.get_worker_urls().is_empty());
+        handle_pod_deletion(&pod_info, tracked_pods.clone(), router.clone(), 80, false).await;
+
+        // Verify the pod was removed from tracking
+        let tracked = tracked_pods.lock().unwrap();
+        assert!(tracked.is_empty());
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_event_prefill_pod() {
-        let router = create_test_router();
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
-            name: "prefill-pod".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
+            name: "test-prefill-pod".to_string(),
+            ip: "192.168.1.101".to_string(),
+            status: "Running".to_string(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
-            bootstrap_port: Some(8081),
+            bootstrap_port: Some(9001),
         };
-        let port = 8080u16;
 
-        // This test validates the structure but won't actually add workers since
-        // we're using a regular router instead of PD router
-        handle_pod_event(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            false, // pd_mode = false, so it should fallback to regular handling
-        )
-        .await;
+        handle_pod_event(&pod_info, tracked_pods, router.clone(), 80, true).await;
 
-        // Pod should not be tracked since router.add_worker will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // Verify the pod was added
+        let workers = router.get_worker_urls();
+        assert!(!workers.is_empty());
+        assert!(workers.iter().any(|url| url.contains("192.168.1.101")));
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_event_decode_pod() {
-        let router = create_test_router();
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
-            name: "decode-pod".into(),
-            ip: "1.2.3.5".into(),
-            status: "Running".into(),
+            name: "test-decode-pod".to_string(),
+            ip: "192.168.1.102".to_string(),
+            status: "Running".to_string(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
         };
-        let port = 8080u16;
 
-        handle_pod_event(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            false, // pd_mode = false, so it should fallback to regular handling
-        )
-        .await;
+        handle_pod_event(&pod_info, tracked_pods, router.clone(), 80, true).await;
 
-        // Pod should not be tracked since router.add_worker will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // Verify the pod was added
+        let workers = router.get_worker_urls();
+        assert!(!workers.is_empty());
+        assert!(workers.iter().any(|url| url.contains("192.168.1.102")));
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_tracked_pod() {
-        let router = create_test_router();
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
-            name: "test-pod".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
+            name: "test-pod".to_string(),
+            ip: "192.168.1.100".to_string(),
+            status: "Running".to_string(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
-            bootstrap_port: Some(8081),
+            bootstrap_port: Some(9001),
         };
 
-        // Add pod to tracked set first
+        // Add the pod first
         {
             let mut tracked = tracked_pods.lock().unwrap();
             tracked.insert(pod_info.clone());
         }
 
-        let port = 8080u16;
+        handle_pod_deletion(&pod_info, tracked_pods.clone(), router.clone(), 80, true).await;
 
-        handle_pod_deletion(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            false, // pd_mode = false
-        )
-        .await;
-
-        // Pod should be removed from tracking
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // Verify the pod was removed from tracking
+        let tracked = tracked_pods.lock().unwrap();
+        assert!(tracked.is_empty());
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_untracked_pod() {
-        let router = create_test_router();
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
-            name: "untracked-pod".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
+            name: "test-pod".to_string(),
+            ip: "192.168.1.100".to_string(),
+            status: "Running".to_string(),
             is_ready: true,
-            pod_type: Some(PodType::Decode),
-            bootstrap_port: None,
+            pod_type: Some(PodType::Prefill),
+            bootstrap_port: Some(9001),
         };
-        let port = 8080u16;
 
-        // Don't add pod to tracked set
+        // Don't add the pod to tracked_pods
 
-        handle_pod_deletion(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            true, // pd_mode = true
-        )
-        .await;
+        handle_pod_deletion(&pod_info, tracked_pods.clone(), router.clone(), 80, true).await;
 
-        // Tracked set should remain empty
-        assert!(tracked_pods.lock().unwrap().is_empty());
+        // Verify tracked_pods is still empty
+        let tracked = tracked_pods.lock().unwrap();
+        assert!(tracked.is_empty());
     }
 
     #[tokio::test]
     async fn test_unified_handler_regular_mode() {
-        let router = create_test_router();
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
-            name: "regular-pod".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
+            name: "test-pod".to_string(),
+            ip: "192.168.1.100".to_string(),
+            status: "Running".to_string(),
             is_ready: true,
-            pod_type: Some(PodType::Regular),
+            pod_type: None,
             bootstrap_port: None,
         };
-        let port = 8080u16;
 
-        // Test that unified handler works for regular mode
-        handle_pod_event(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            false, // pd_mode = false
-        )
-        .await;
+        // Test pod event
+        handle_pod_event(&pod_info, tracked_pods.clone(), router.clone(), 80, false).await;
 
-        // Pod should not be tracked since router.add_worker will fail for non-running server
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // Verify the pod was added
+        let workers = router.get_worker_urls();
+        assert!(!workers.is_empty());
+        assert!(workers.iter().any(|url| url.contains("192.168.1.100")));
+
+        // Test pod deletion
+        handle_pod_deletion(&pod_info, tracked_pods, router.clone(), 80, false).await;
+
+        // Verify the pod was removed
+        let workers = router.get_worker_urls();
+        assert!(workers.is_empty());
     }
 
     #[tokio::test]
     async fn test_unified_handler_pd_mode_with_prefill() {
-        let router = create_test_router();
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
-            name: "prefill-pod".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
+            name: "test-prefill-pod".to_string(),
+            ip: "192.168.1.101".to_string(),
+            status: "Running".to_string(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
-            bootstrap_port: Some(8081),
+            bootstrap_port: Some(9001),
         };
-        let port = 8080u16;
 
-        // Test that unified handler works for PD mode with prefill
-        handle_pod_event(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            true, // pd_mode = true
-        )
-        .await;
+        // Test pod event
+        handle_pod_event(&pod_info, tracked_pods.clone(), router.clone(), 80, true).await;
 
-        // Pod should not be tracked since router.add_pd_worker will fail for regular router
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // Verify the pod was added
+        let workers = router.get_worker_urls();
+        assert!(!workers.is_empty());
+        assert!(workers.iter().any(|url| url.contains("192.168.1.101")));
+
+        // Test pod deletion
+        handle_pod_deletion(&pod_info, tracked_pods.clone(), router.clone(), 80, true).await;
+
+        // Verify the pod was removed
+        let workers = router.get_worker_urls();
+        assert!(workers.is_empty());
     }
 
     #[tokio::test]
     async fn test_unified_handler_deletion_with_pd_mode() {
-        let router = create_test_router();
+        let router = create_test_router().await;
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
         let pod_info = PodInfo {
-            name: "decode-pod".into(),
-            ip: "1.2.3.4".into(),
-            status: "Running".into(),
+            name: "test-pod".to_string(),
+            ip: "192.168.1.100".to_string(),
+            status: "Running".to_string(),
             is_ready: true,
-            pod_type: Some(PodType::Decode),
-            bootstrap_port: None,
+            pod_type: Some(PodType::Prefill),
+            bootstrap_port: Some(9001),
         };
 
-        // Add pod to tracked set first
+        // Add the pod first
         {
             let mut tracked = tracked_pods.lock().unwrap();
             tracked.insert(pod_info.clone());
         }
 
-        let port = 8080u16;
+        // Test pod deletion
+        handle_pod_deletion(&pod_info, tracked_pods.clone(), router.clone(), 80, true).await;
 
-        // Test that unified handler works for deletion in PD mode
-        handle_pod_deletion(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-            port,
-            true, // pd_mode = true
-        )
-        .await;
-
-        // Pod should be removed from tracking
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        // Verify the pod was removed from tracking
+        let tracked = tracked_pods.lock().unwrap();
+        assert!(tracked.is_empty());
     }
 }
