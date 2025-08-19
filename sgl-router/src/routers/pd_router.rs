@@ -670,9 +670,10 @@ impl PDRouter {
                             .await;
 
                         // Record outcomes for circuit breakers
-                        let is_success = response.status().is_success();
-                        prefill.record_outcome(is_success);
-                        decode.record_outcome(is_success);
+                        let _status = response.status();
+                        let not_error = _status.is_success() || _status.is_client_error();
+                        prefill.record_outcome(not_error);
+                        decode.record_outcome(not_error);
 
                         response
                     }
@@ -723,7 +724,7 @@ impl PDRouter {
             decode.url()
         );
 
-        if return_logprob {
+        if true || return_logprob {
             // Build prefill request with shared client when we need response body
             let prefill_request = self.build_post_with_headers(
                 &self.client,
@@ -762,13 +763,43 @@ impl PDRouter {
                         );
 
                         // Return the error response from decode server
-                        match res.bytes().await {
-                            Ok(error_body) => {
-                                return (status, error_body).into_response();
-                            }
-                            Err(e) => {
-                                return (status, format!("Decode server error: {}", e))
-                                    .into_response();
+                        if is_stream {
+                            let error_message = match res.bytes().await {
+                                Ok(error_body) => {
+                                    if let Ok(error_json) = serde_json::from_slice::<Value>(&error_body) {
+                                        serde_json::to_string(&error_json).unwrap_or_else(|_| {
+                                            format!("Decode server error: {}", status)
+                                        })
+                                    } else {
+                                        String::from_utf8_lossy(&error_body).to_string()
+                                    }
+                                }
+                                Err(e) => {
+                                    format!("Decode server error: {}", e)
+                                }
+                            };
+
+                            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(
+                                format!("data: {{\"error\": {{\"message\": \"{}\", \"status\": {}}}}}\n\n",
+                                    error_message, status.as_u16())
+                                )));
+
+                            return Self::create_streaming_response(
+                                error_stream,
+                                status,
+                                None,
+                                return_logprob,
+                                Some(decode.url().to_string()),
+                            );
+                        } else {
+                            match res.bytes().await {
+                                Ok(error_body) => {
+                                    return (status, error_body).into_response();
+                                }
+                                Err(e) => {
+                                    return (status, format!("Decode server error: {}", e))
+                                            .into_response();
+                                }
                             }
                         }
                     }
@@ -879,9 +910,12 @@ impl PDRouter {
 
                         // Return the error response from decode server
                         match res.bytes().await {
-                            Ok(error_body) => (status, error_body).into_response(),
+                            Ok(error_body) => {
+                                return (status, error_body).into_response();
+                            }
                             Err(e) => {
-                                (status, format!("Decode server error: {}", e)).into_response()
+                                return (status, format!("Decode server error: {}", e))
+                                    .into_response();
                             }
                         }
                     } else if is_stream {
