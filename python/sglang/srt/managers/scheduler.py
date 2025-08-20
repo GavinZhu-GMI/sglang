@@ -1359,6 +1359,13 @@ class Scheduler(
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+            # Add debug logging
+            logger.info(f"Memory check - max_total: {self.max_total_num_tokens}, available: {available_size}, evictable: {evictable_size}, protected: {protected_size}")
+            msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}"
+            msg += f"Running requests: {len(self.running_batch.reqs)}, "
+            msg += f"Waiting queue: {len(self.waiting_queue)}, "
+            msg += f"Grammar queue: {len(self.grammar_queue)}"
+            logger.info(msg)
             raise ValueError(msg)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
