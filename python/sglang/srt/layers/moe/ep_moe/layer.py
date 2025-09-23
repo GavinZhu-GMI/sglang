@@ -88,6 +88,28 @@ class EPMoE(FusedMoE):
 
     """
 
+    @property
+    def w13_weight_scale(self):
+        """Compatibility property for TensorRT-Model-Optimizer quantized models.
+
+        TensorRT-MO uses 'w13_weight_scale_inv' naming convention,
+        but SGLang expects 'w13_weight_scale'.
+        """
+        if hasattr(self, 'w13_weight_scale_inv'):
+            return self.w13_weight_scale_inv
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute 'w13_weight_scale'")
+
+    @property
+    def w2_weight_scale(self):
+        """Compatibility property for TensorRT-Model-Optimizer quantized models.
+
+        TensorRT-MO uses 'w2_weight_scale_inv' naming convention,
+        but SGLang expects 'w2_weight_scale'.
+        """
+        if hasattr(self, 'w2_weight_scale_inv'):
+            return self.w2_weight_scale_inv
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute 'w2_weight_scale'")
+
     def __init__(
         self,
         num_experts: int,
@@ -339,6 +361,28 @@ class DeepEPMoE(EPMoE):
     """
 
     _has_printed = False
+
+    @property
+    def w13_weight_scale(self):
+        """Compatibility property for TensorRT-Model-Optimizer quantized models.
+
+        TensorRT-MO uses 'w13_weight_scale_inv' naming convention,
+        but SGLang expects 'w13_weight_scale'.
+        """
+        if hasattr(self, 'w13_weight_scale_inv'):
+            return self.w13_weight_scale_inv
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute 'w13_weight_scale'")
+
+    @property
+    def w2_weight_scale(self):
+        """Compatibility property for TensorRT-Model-Optimizer quantized models.
+
+        TensorRT-MO uses 'w2_weight_scale_inv' naming convention,
+        but SGLang expects 'w2_weight_scale'.
+        """
+        if hasattr(self, 'w2_weight_scale_inv'):
+            return self.w2_weight_scale_inv
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute 'w2_weight_scale'")
 
     def __init__(
         self,
