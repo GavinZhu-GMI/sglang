@@ -1,7 +1,11 @@
+import sys
+
 import pytest
 import torch
-from sgl_kernel import cutlass_w4a8_moe_mm, sgl_per_tensor_quant_fp8
+from sgl_kernel import cutlass_w4a8_moe_mm
 from utils import is_hopper
+
+from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
@@ -148,7 +152,7 @@ def _per_tensor_quant_fp8(
         device=x.device,
         dtype=torch.float32,
     )
-    sgl_per_tensor_quant_fp8(x, x_q, x_s, is_static=False)
+    per_tensor_quant_fp8(x, x_q, x_s, is_static=False)
     return x_q, x_s
 
 
@@ -157,8 +161,8 @@ def _per_tensor_quant_fp8(
     reason="cutlass_w4a8_moe_mm is only supported on sm90",
 )
 @pytest.mark.parametrize("batch_size", [2, 4, 8, 16, 32])
-@pytest.mark.parametrize("k", [512, 1024, 2048, 4096, 7168])
-@pytest.mark.parametrize("n", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("k", [256, 512, 1024, 2048, 4096, 7168])
+@pytest.mark.parametrize("n", [256, 512, 1024, 2048, 7168])
 @pytest.mark.parametrize("num_experts", [2, 4, 6, 8])
 def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
     torch.manual_seed(0)
@@ -280,4 +284,4 @@ def ref_grouped_gemm(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

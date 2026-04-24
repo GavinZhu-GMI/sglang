@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """Inference-only Qwen3Next MTP Speculative Decoding."""
+
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -21,14 +22,14 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.qwen3_moe import Qwen3MoeModel
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -62,14 +63,17 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         config.num_hidden_layers = 1
         config.full_attention_interval = 1
         self.model = Qwen3NextModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            is_nextn=True,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -92,12 +96,13 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
 
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            hidden_states,
-        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                hidden_states,
+            )
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

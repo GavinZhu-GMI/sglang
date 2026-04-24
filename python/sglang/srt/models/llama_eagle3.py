@@ -19,6 +19,7 @@ from sglang.srt.utils import add_prefix
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
+import copy
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -27,7 +28,7 @@ from transformers import LlamaConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -110,14 +111,17 @@ class LlamaModel(nn.Module):
         super().__init__()
         self.config = config
 
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_scaling = rope_parameters
+        else:
+            rope_scaling = getattr(config, "rope_scaling", None)
         self.is_mrope_enabled = (
-            hasattr(config, "rope_scaling")
-            and config.rope_scaling is not None
-            and "mrope_section" in config.rope_scaling
+            rope_scaling is not None and "mrope_section" in rope_scaling
         )
         # fix rope_scaling for qwen2.5-vl
         if self.is_mrope_enabled:
-            config.rope_scaling["rope_type"] = "default"
+            rope_scaling["rope_type"] = "default"
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
@@ -150,7 +154,18 @@ class LlamaModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            embeds = self.embed_tokens(input_ids)
+            embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            ):
+                assert embeds is not None
+                embeds = torch.cat(
+                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
+                )
+            if embeds is None:
+                embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
 
@@ -160,6 +175,10 @@ class LlamaModel(nn.Module):
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
+
+        # idle batch
+        if hidden_states.shape[0] == 0:
+            return hidden_states, [hidden_states]
 
         residual = None
         hidden_states, residual = self.midlayer(
@@ -212,7 +231,12 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 prefix=add_prefix("lm_head", prefix),
             )
 
-        self.logits_processor = LogitsProcessor(config)
+        config_ = copy.deepcopy(config)
+        config_.vocab_size = (
+            config_.draft_vocab_size
+        )  # draft logits processor has it's own vocab size
+        self.logits_processor = LogitsProcessor(config_)
+
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 
