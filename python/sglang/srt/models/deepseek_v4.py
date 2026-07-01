@@ -1927,6 +1927,22 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            # aux_hidden_states are captured per-layer ABOVE, before this gather, so
+            # they are still CP-split (round-robin sharded) while hidden_states is now
+            # full-sequence. The logits processor indexes BOTH with the same
+            # full-sequence last-token indices, so gather+rerange the aux tensors too
+            # -- otherwise the DSpark/EAGLE3 last-token index (up to full seq_len) is
+            # out of bounds on the per-rank shard. See logits_processor._get_pruned_states.
+            if aux_hidden_states:
+                aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux,
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    for aux in aux_hidden_states
+                ]
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
